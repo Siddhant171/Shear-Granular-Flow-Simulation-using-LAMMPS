@@ -1,0 +1,78 @@
+# STEP 1: BASIC WORLD SETTINGS
+units            si          # Use standard metric units (meters, kilograms, seconds)
+dimension        2           # 2D simulation (flat surface)
+atom_style       sphere      # Particles are circles with mass and rotation
+boundary         s f p       # 's' for shrink-wrap: the box edges grow or shrink 
+                             # to fit the particles automatically.
+comm_modify      vel yes     # Ensures particle speeds are tracked correctly
+
+# Define the size of our simulation "sandbox"
+variable         d equal 0.002        # Grain diameter (2 mm)
+variable         width equal 0.1      # 10 cm wide
+variable         height equal 0.032    # 3.2 cm tall
+
+# Create the mathematical space for the simulation
+# We make it slightly wider than the 'width' so the boundaries have "room to breathe"
+region           box block -0.05 0.15 0 ${height} -$d $d units box
+create_box       3 box                # Allow up to 3 different types of grains
+neighbor         $d bin               # Helps the computer calculate collisions
+neigh_modify     delay 0
+
+
+
+
+# STEP 2: THE PHYSICS OF A COLLISION
+# These variables define how grains behave when they hit each other:
+variable         kn equal 1e5         # Normal stiffness (how hard/bouncy they are)
+variable         kt equal 2e4         # Tangential stiffness (sideways friction)
+variable         gamman equal 50      # Normal damping (energy lost when bouncing)
+variable         gammat equal 15      # Tangential damping (energy lost to friction)
+
+# Apply these "rules of contact" to all particles
+pair_style       gran/hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1
+pair_coeff       * *
+
+
+
+
+# STEP 3: FORCES AND WALLS
+# Integrate: Tell the computer to move the particles based on forces (Newton's Laws)
+fix              integrate all nve/sphere
+fix              grav all gravity 9.81 vector 0.0 -1.0 0.0  # Earth's gravity pulling DOWN
+fix              z_enforce all enforce2d                     # Keep particles on the 2D plane
+
+# THE MOLD: We create 4 invisible solid walls to hold the grains in place
+# yplane 0.0: The floor
+# yplane ${height}: The ceiling
+# xplane 0.0 ${width}: The left and right walls
+fix              bottom_wall all wall/gran hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1 yplane 0.0 NULL
+fix              top_wall all wall/gran hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1 yplane NULL ${height}
+fix              x_walls all wall/gran hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1 xplane 0.0 ${width}
+
+
+
+
+# STEP 4: CREATING THE GRAINS
+# Arrange the particles in a square grid (lattice) with a tiny bit of space between them
+lattice          sq 0.0021
+
+# Define exactly where to drop the grains (inside the walls with a small 2mm gap)
+region           drop_reg block 0.002 $(v_width-0.002) 0.002 $(v_height-0.002) -$d $d units box
+
+# Spawning the particles!
+create_atoms     1 region drop_reg
+
+# Give the particles their physical properties
+set              type 1 diameter $d density 2500   # 2mm size, density of stone/glass
+
+
+
+# STEP 5: RUNNING THE CLOCK
+
+thermo           1000        # Print a status update every 1000 steps
+timestep         1e-5        # Each "frame" is 0.00001 seconds
+run              50000       # Run the simulation for 50,000 steps to let grains settle
+
+# Save the final state as a 'restart' file. 
+# This file "freezes" the pile so the next script (Compression) can pick up where we left off.
+write_restart    restart3.poured

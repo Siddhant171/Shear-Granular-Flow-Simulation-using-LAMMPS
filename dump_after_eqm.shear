@@ -1,0 +1,131 @@
+# STEP 1: INITIAL SETUP
+
+units         si          # Use standard metric units (meters, kilograms, seconds, Pascals)
+dimension     2           # This is a 2D simulation (like looking at a tray of marbles)
+atom_style    sphere      # Our particles are circular grains with mass and rotation
+
+# Box Boundaries: 
+# 'p' means Periodic (grains exiting the left side reappear on the right).
+# 'f' means Fixed (top and bottom have actual walls/boundaries).
+boundary      p f p  
+
+# Prepare the computer to track particle velocities across processors
+comm_modify   vel yes
+
+# Load the grains we already packed and compressed in previous steps
+read_data     compressed_grains.data
+
+# Turn the rectangular box into a "Triclinic" box.
+# Why? Because a rectangle can't "lean" sideways. A triclinic box can become a 
+# parallelogram, which is necessary to simulate shearing flow.
+change_box    all triclinic
+
+
+
+# STEP 2: DEFINING THE MATERIAL (PHYSICS)
+
+variable      d equal 0.0008      # Grain diameter (0.8 mm)
+variable      kn equal 400        # Normal stiffness (how "bouncy" the grains are)
+
+# Friction variables: 
+# Without 'kt' and 'gammat', grains would be perfectly slippery like ice.
+# Friction lets them roll and grab each other.
+variable      kt equal 200        # Tangential stiffness (friction resistance)
+variable      gamman equal 1670*(9.8/${d})^0.5 # Normal damping (energy lost in a bounce)
+variable      gammat equal 50     # Tangential damping (energy lost to friction)
+
+# Define the mathematical model for grain collisions (Hooke's Law with Friction)
+pair_style    gran/hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1
+pair_coeff    * *
+
+# Neighborhood list: Helps the computer calculate collisions faster
+neighbor      ${d} bin
+neigh_modify  delay 0
+
+
+
+# STEP 3: CREATING THE SHEAR PLATES
+
+# We want to turn the very top and very bottom layers of grains into solid "walls."
+variable      y_min equal ylo+0.002 # Bottom 2mm
+variable      y_max equal yhi-0.002 # Top 2mm
+
+region        bot_reg block INF INF 0.0 ${y_min} INF INF
+region        top_reg block INF INF ${y_max} INF INF INF
+
+# Group the grains based on where they are located
+group         bot_grains region bot_reg    # The "Floor"
+group         top_grains region top_reg    # The "Ceiling"
+group         mobile subtract all bot_grains top_grains # The "Flowing Grains" in the middle
+
+# Newton's Laws: Only the middle grains are allowed to move freely based on forces.
+fix           1 mobile nve/sphere
+fix           3 all enforce2d # Keep everything strictly in the 2D plane
+
+
+
+# STEP 4: PRESSURE & VELOCITY CONTROLS
+
+# To calculate current Pressure (Stress in the Y direction)
+compute       peratom  all stress/atom NULL
+compute       p_yy_sum all reduce sum c_peratom[2]
+variable      P_inst   equal -c_p_yy_sum/(lx*ly)
+
+# Target Pressure settings: We want to keep the "squeeze" at 100 Pascals
+variable      P_target  equal 100.0     
+variable      gain_P    equal 1e-4      # Sensitivity: how much to move the wall if pressure is off
+variable      max_delta equal 5e-6      # Safety limit: don't move the wall too fast in one go
+variable      run_steps equal 100       # Check pressure every 100 steps
+variable      dt_val    equal 2e-07     # Timestep (how much time passes per "frame")
+
+# Shear Speed: How fast the top plate slides sideways
+variable      shear_rate equal 0.1  #Change the shear rate by changing 0.1 to some other value
+variable      v_top equal ${shear_rate}*yhi
+
+# Initialize movement:
+velocity      bot_grains set 0.0 0.0 0.0 # Floor is frozen
+fix           freeze_bot bot_grains move linear 0.0 0.0 0.0
+
+velocity      top_grains set ${v_top} 0.0 0.0 # Ceiling starts sliding sideways
+
+
+
+# STEP 5: THE SIMULATION LOOP (THE "BRAIN")
+
+# We run a loop. In each iteration, we check: "Is the pressure 100Pa?"
+# If it's too high, we move the top wall up slightly. If too low, we move it down.
+variable      i loop 40000 
+label         shear_compress_loop
+
+    # Start saving data (dumping) only after the system has settled (step 300,000)
+    if "$(step) >= 300000 && ${dump_started} == 0" then &
+       "dump 1 all custom 10000 output-shear-*.txt id type x y z vx vy vz diameter mass c_peratom[1] c_peratom[2] c_peratom[4]" &
+       "dump_modify 1 sort id" &
+       "variable dump_started equal 1"
+
+    # Calculate the error: How far are we from our 100Pa target?
+    variable    P_diff equal "v_P_target - v_P_inst"
+    variable    y_move equal "-v_gain_P * v_P_diff"
+
+    # Clamp the movement so the wall doesn't "explode" outward or crush the grains too fast
+    if "${y_move} > ${max_delta}"  then "variable y_move equal  ${max_delta}"
+    if "${y_move} < -${max_delta}" then "variable y_move equal -${max_delta}"
+
+    # Calculate how fast the wall needs to move vertically to reach that new position
+    variable    y_vel equal "v_y_move / (v_run_steps * v_dt_val)"
+
+    # Refresh the commands that move the box and the top grains
+    unfix        deform_box
+    unfix        move_top
+
+    # deform: Tilts the box sideways (shear) AND changes the height (pressure control)
+    fix          deform_box all deform 1 xy erate ${shear_rate} y delta 0.0 ${y_move} remap v
+    # move_top: Physically slides the top plate grains to match the box tilt
+    fix          move_top top_grains move linear ${v_top} ${y_vel} 0.0
+
+    run          ${run_steps} post no # Run for 100 steps, then repeat the loop
+    next         i
+jump            SELF shear_compress_loop
+
+# Save the final positions of all grains after shearing is done
+write_data      sheared_compressed_grains.data

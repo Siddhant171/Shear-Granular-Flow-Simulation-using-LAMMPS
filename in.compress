@@ -1,0 +1,107 @@
+# FEEDBACK LOGIC (The "Brain" of the script):
+# 1. Free descent: The wall is high up, feels no pressure, so it drops fast.
+# 2. Contact: The wall hits the grains; pressure starts to climb.
+# 3. Equilibrium: The wall stops moving once it feels exactly 100Pa of push-back.
+
+
+
+# 1. INITIALIZATION (Basic Setup)
+units            si          # Use metric units (meters, kg, seconds)
+dimension        2           # 2D simulation (flat plane)
+atom_style       sphere      # Particles are spheres
+boundary         f f p       # Top/Bottom are Fixed (walls), Left/Right are Periodic
+comm_modify      vel yes     # Helps different computer processors talk about speeds
+
+# Load the pile of grains we created in the "Pouring" step
+read_data        Original_data.pour
+
+# Resize the box height. We make it 0.075m (7.5cm) tall to give the 
+# grains and the top wall some "breathing room" before we start squeezing.
+change_box       all y final 0.0 0.075
+
+# 2. CONTACT PARAMETERS (How grains touch)
+variable         d        equal 0.0008   # Grain diameter (0.8 mm)
+variable         width    equal 0.048    # Width of the box
+
+# Stiffness and Damping
+variable         kn       equal 400      # How "hard" the grains are
+variable         kt       equal 0.0      # Friction is 0 during compression!
+variable         gamman   equal 1670*(9.8/${d})^0.5 # Bounciness/Damping
+variable         gammat   equal 0.0      # Friction damping is 0
+
+# Set the physics: We use 0 friction here so grains slide into 
+# tight spaces easily, helping them pack better.
+pair_style       gran/hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1
+pair_coeff       * *
+
+neighbor         ${d} bin
+neigh_modify     delay 0
+
+# 3. INTEGRATION (Basic Physics)
+fix              nve_int all nve/sphere   # Use Newton's laws for spheres
+fix              grav    all gravity 9.8 spherical 0.0 -180.0 # Add Gravity pulling down
+fix              enforce all enforce2d    # Prevent any 3D movement
+
+# 4. DYNAMIC TOP WALL
+# We create a physical "ceiling" that always stays at the very top of the box (yhi).
+variable         ytop equal yhi
+region           box_region block 0.0 ${width} 0.0 v_ytop -0.01 0.01 open 5 open 6
+fix              walls all wall/gran/region hooke/history ${kn} ${kt} ${gamman} ${gammat} 0.4 1 region box_region
+
+# 5. PRESSURE MEASUREMENT
+# The script calculates how much the grains are pushing UP against the top wall.
+compute          peratom  all stress/atom NULL
+compute          p_yy_sum all reduce sum c_peratom[2]
+variable         P_inst   equal -c_p_yy_sum/(lx*ly) # Current Pressure in Pascals
+
+# 6. CONTROL PARAMETERS
+variable         P_target  equal 100.0     # You can set this value to the pressure you want to set it to reach
+variable         gain_P    equal 1e-4      # Sensitivity: how much to move per step
+variable         max_delta equal 5e-6      # Safety limit: don't move the wall too far/fast
+
+# 7. DIAGNOSTICS & SAVING
+# Record the pressure to a text file so we can graph it later
+fix              press_log all ave/time 1 1 1 v_P_inst file raw_pressure.dat
+
+thermo           100   # Print updates to the screen every 100 steps
+thermo_style     custom step v_P_inst v_P_target yhi vol
+
+# Create a "movie" file (dump) that can be opened in OVITO to see the compression
+dump             1 all custom 1000 dump_compress.dump id type x y z radius diameter vx vy omegaz fx fy
+dump_modify      1 sort id
+
+timestep         2e-07 # Each step represents a tiny fraction of a second
+
+# 8. THE PRESSURE FEEDBACK LOOP
+# It runs 10,000 mini-simulations of 100 steps each.
+
+fix              compress_box all deform 1 y delta 0.0 0.0 remap none
+run              0 post no
+
+variable         i loop 10000
+label            compress_loop
+
+    # 1. Calculate the Error: (Target Pressure - Current Pressure)
+    variable    P_diff equal "v_P_target - v_P_inst"
+
+    # 2. Decide movement: If error is large, move the wall down.
+    variable    y_move equal "-v_gain_P * v_P_diff"
+
+    # 3. Safety Check: Don't let the wall jump too far if it hasn't hit anything yet.
+    if          "${y_move} > ${max_delta}"  then "variable y_move equal  ${max_delta}"
+    if          "${y_move} < -${max_delta}" then "variable y_move equal -${max_delta}"
+
+    # 4. Apply the movement: "Unfix" the old wall position and "Refix" it at the new height.
+    unfix       compress_box
+    fix         compress_box all deform 1 y delta 0.0 ${y_move} remap none
+
+    # 5. Let the simulation run for 100 steps to see how the grains react.
+    run         100 post no
+
+    next         i
+jump            SELF compress_loop # Repeat until loop is finished
+
+# 9. SAVE THE FINAL STATE
+# Save the final positions of the perfectly packed grains. 
+# This file is the starting point for the Shear simulation.
+write_data      compressed_grains.data
