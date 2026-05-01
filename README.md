@@ -8,7 +8,6 @@ The simulation combines discrete element modeling with MATLAB-based coarse-grain
 
 **Author**: Siddhantkumar Thute  
 **Advisor**: Harkirat Singh  
-**Repository**: https://github.com/Siddhantkumar/Granular-Shear-Analysis
 
 ## Problem Statement and Objectives
 
